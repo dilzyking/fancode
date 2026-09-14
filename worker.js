@@ -53,9 +53,6 @@ export default {
 
 /* ============================================================
    REWRITE THE M3U8
-   - every sub-playlist line → /worker.m3u8?url=<abs>
-   - every segment line      → /seg.ts?url=<abs>
-   - every URI="..." in tags → /seg.ts?url=<abs>
    ============================================================ */
 async function proxyPlaylist(target, workerOrigin) {
   let upstream;
@@ -87,7 +84,7 @@ async function proxyPlaylist(target, workerOrigin) {
 
       if (line === "") return rawLine;
 
-      // Rewrite URI="..." attributes inside tags (#EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA)
+      // Rewrite URI="..." inside tags (#EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA)
       if (line.startsWith("#")) {
         return line.replace(/URI="([^"]+)"/g, (_, uri) => {
           const abs = new URL(uri, base).toString();
@@ -95,15 +92,14 @@ async function proxyPlaylist(target, workerOrigin) {
         });
       }
 
-      // Content lines
       const abs = new URL(line, base).toString();
 
-      // Sub-playlist → back through /worker.m3u8
+      // Sub-playlist
       if (abs.split("?")[0].endsWith(".m3u8")) {
         return `${workerOrigin}/worker.m3u8?url=${encodeURIComponent(abs)}`;
       }
 
-      // Segment / key / init file → /seg.ts
+      // Segment / key / init
       return `${workerOrigin}/seg.ts?url=${encodeURIComponent(abs)}`;
     })
     .join("\n");
