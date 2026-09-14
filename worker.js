@@ -1,7 +1,8 @@
 // ============================================================
-//  FANCODE HLS PROXY — Cloudflare Worker (fixed manifest routing)
-//  Stream URL:  https://<your-worker>.workers.dev/worker.m3u8
-//  Player page: https://<your-worker>.workers.dev/
+//  FANCODE HLS PROXY — Cloudflare Worker
+//  /            → rewritten master m3u8   (players use this)
+//  /seg.ts?url= → segment / key proxy
+//  /player      → Plyr HTML page (human-friendly)
 // ============================================================
 
 const STREAM_URL =
@@ -21,34 +22,29 @@ export default {
   async fetch(request) {
     const reqUrl = new URL(request.url);
 
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
 
-    // ---------- Route 1: /worker.m3u8  → MASTER PLAYLIST (rewritten) ----------
-    if (reqUrl.pathname === "/worker.m3u8") {
-      // If a sub-playlist URL is provided, fetch that; else fetch the master
+    // ---- /  →  master m3u8 (this is what players load) ----
+    if (reqUrl.pathname === "/" || reqUrl.pathname === "") {
       const sub = reqUrl.searchParams.get("url");
       return proxyPlaylist(sub || STREAM_URL, reqUrl.origin);
     }
 
-    // ---------- Route 2: /seg.ts?url=... → SEGMENT / KEY PROXY ----------
+    // ---- /seg.ts?url=...  →  binary segment / key ----
     if (reqUrl.pathname === "/seg.ts") {
       const target = reqUrl.searchParams.get("url");
       if (!target) return new Response("Missing ?url=", { status: 400, headers: CORS });
       return proxyBinary(target);
     }
 
-    // ---------- Route 3: / → HTML player page ----------
-    if (reqUrl.pathname === "/" || reqUrl.pathname === "") {
+    // ---- /player  →  Plyr HTML page ----
+    if (reqUrl.pathname === "/player") {
       return new Response(PLAYER_HTML, {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
 
-    // ---------- Anything else → 404 ----------
-    return new Response("Not found. Use /worker.m3u8", { status: 404, headers: CORS });
+    return new Response("Not found", { status: 404, headers: CORS });
   },
 };
 
@@ -66,17 +62,11 @@ async function proxyPlaylist(target, workerOrigin) {
       redirect: "follow",
     });
   } catch (e) {
-    return new Response("# fetch failed: " + e.message, {
-      status: 502,
-      headers: { ...CORS, "Content-Type": "application/vnd.apple.mpegurl" },
-    });
+    return m3u8Response("# fetch failed: " + e.message, 502);
   }
 
   if (!upstream.ok) {
-    return new Response(`# upstream ${upstream.status}`, {
-      status: upstream.status,
-      headers: { ...CORS, "Content-Type": "application/vnd.apple.mpegurl" },
-    });
+    return m3u8Response(`# upstream ${upstream.status}`, upstream.status);
   }
 
   const text = await upstream.text();
@@ -87,10 +77,9 @@ async function proxyPlaylist(target, workerOrigin) {
     .map((rawLine) => {
       const line = rawLine.trim();
 
-      // 1. Blank line → keep
       if (line === "") return rawLine;
 
-      // 2. Rewrite URI="..." attributes inside tags (#EXT-X-KEY, #EXT-X-MAP, etc.)
+      // Tags — rewrite URI="..." (keys, init segments)
       if (line.startsWith("#")) {
         return line.replace(/URI="([^"]+)"/g, (_, uri) => {
           const abs = new URL(uri, base).toString();
@@ -98,14 +87,12 @@ async function proxyPlaylist(target, workerOrigin) {
         });
       }
 
-      // 3. Real content line: either a sub-playlist (.m3u8) or a segment
+      // Content lines
       const abs = new URL(line, base).toString();
 
       if (abs.split("?")[0].endsWith(".m3u8")) {
-        // Sub-playlist → keep going through /worker.m3u8
-        return `${workerOrigin}/worker.m3u8?url=${encodeURIComponent(abs)}`;
+        return `${workerOrigin}/?url=${encodeURIComponent(abs)}`;
       }
-      // Segment (.ts, .m4s, .aac, .key …)
       return `${workerOrigin}/seg.ts?url=${encodeURIComponent(abs)}`;
     })
     .join("\n");
@@ -147,42 +134,75 @@ async function proxyBinary(target) {
   });
 }
 
-/* ---------- Small built-in web player ---------- */
+function m3u8Response(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: { ...CORS, "Content-Type": "application/vnd.apple.mpegurl" },
+  });
+}
+
+/* ---------- Plyr HTML page (served at /player) ---------- */
 const PLAYER_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Fancode Live</title>
+<title>Fancode Live · Plyr</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css">
 <style>
   html,body{margin:0;background:#000;height:100%;overflow:hidden;font-family:system-ui,sans-serif}
-  #v{width:100vw;height:100vh;display:block;background:#000}
-  #msg{position:absolute;top:16px;left:16px;color:#fff;background:rgba(0,0,0,.6);
-       padding:8px 14px;border-radius:8px;font-size:13px;z-index:10}
+  .plyr{width:100%;height:100%;--plyr-color-main:#3b82f6}
+  video{width:100%;height:100%;object-fit:contain;background:#000}
+  #msg{position:absolute;top:16px;left:16px;z-index:20;color:#fff;
+       background:rgba(0,0,0,.65);padding:8px 14px;border-radius:8px;font-size:13px}
+  #msg.error{background:rgba(220,38,38,.9)}
 </style>
 </head>
 <body>
-  <video id="v" controls autoplay playsinline></video>
-  <div id="msg">Loading…</div>
+  <video id="player" playsinline controls></video>
+  <div id="msg">Loading stream…</div>
 
+  <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
-  <script>
-    const video = document.getElementById('v');
-    const msg   = document.getElementById('msg');
-    const SRC   = location.origin + '/worker.m3u8';   // ← clean manifest URL
 
-    if (window.Hls && Hls.isSupported()) {
-      const hls = new Hls({ lowLatencyMode: true, enableWorker: true });
-      hls.loadSource(SRC);
+  <script>
+    const STREAM_SRC = location.origin + "/";   // ← root = m3u8 now
+    const video = document.getElementById('player');
+    const msg   = document.getElementById('msg');
+
+    function showError(t){ msg.textContent = t; msg.classList.add('error'); msg.style.display='block'; }
+
+    let hls = null;
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = STREAM_SRC;
+      video.addEventListener('loadedmetadata', ()=>{ msg.style.display='none'; });
+      video.addEventListener('error', ()=>showError('Native HLS error'));
+    } else if (window.Hls && Hls.isSupported()) {
+      hls = new Hls({ lowLatencyMode:true, enableWorker:true, backBufferLength:30 });
+      hls.loadSource(STREAM_SRC);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { msg.style.display = 'none'; video.play().catch(()=>{}); });
-      hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) msg.textContent = 'Error: ' + d.details; });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = SRC;
-      video.addEventListener('loadedmetadata', () => { msg.style.display = 'none'; });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, ()=>{ msg.style.display='none'; });
+      hls.on(Hls.Events.ERROR, (_, data)=>{
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) { showError('Network error — retrying…'); hls.startLoad(); }
+        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { showError('Media error — recovering…'); hls.recoverMediaError(); }
+        else { showError('Fatal: ' + data.details); hls.destroy(); }
+      });
     } else {
-      msg.textContent = 'HLS not supported';
+      showError('HLS not supported in this browser');
     }
+
+    const player = new Plyr(video, {
+      controls: ['play-large','restart','play','progress','current-time','duration',
+                 'mute','volume','captions','settings','pip','airplay','fullscreen'],
+      settings: ['captions','quality','speed'],
+      autoplay: true, muted: false, seekTime: 10,
+      keyboard: { focused: true, global: true },
+    });
+
+    player.on('ready', ()=>{ msg.style.display='none'; player.play().catch(()=>{}); });
   </script>
 </body>
 </html>`;
