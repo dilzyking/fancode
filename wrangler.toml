@@ -1,0 +1,7 @@
+name = "fancode-proxy"
+main = "worker.js"
+compatibility_date = "2024-10-01"
+
+# Optional: uncomment if you want a custom route
+# route = "stream.yourdomain.com/*"
+# zone_name = "yourdomain.com"
